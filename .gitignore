@@ -1,0 +1,29 @@
+# Node.js
+node_modules/
+.env
+dist/
+.cache/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# TypeScript
+*.tsbuildinfo
+
+# VS Code
+.vscode/
+
+# Logs
+logs/
+*.log
+
+# Playwright (if using)
+playwright-report/
+test-results/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Optional for Railway/Render

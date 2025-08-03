@@ -1,0 +1,35 @@
+{
+  "compilerOptions": {
+    // File Layout
+    "rootDir": "./src",
+    "outDir": "./dist",
+
+    // Environment Settings
+    "module": "nodenext",                  // ✅ REQUIRED for nodenext resolution
+    "moduleResolution": "nodenext",        // ✅ REQUIRED if using modern modules
+    "target": "ES2020",
+    "esModuleInterop": true,
+
+    // Type support
+    "types": ["node"],                     // ✅ Needed for Node types
+    "lib": ["esnext"],
+
+    // Other Outputs
+    "sourceMap": true,
+    "declaration": true,
+    "declarationMap": true,
+    "strict": false,
+
+    // Type Safety
+    "noUncheckedIndexedAccess": true,
+    // "strictNullChecks": false,              // ✅ Required for exactOptionalPropertyTypes
+    // "exactOptionalPropertyTypes": true,
+
+    // Module system
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
