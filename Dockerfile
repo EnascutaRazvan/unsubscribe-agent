@@ -1,12 +1,12 @@
 FROM mcr.microsoft.com/playwright:v1.44.1-jammy
 
+# Install pnpm globally
+RUN npm install -g pnpm
+
 WORKDIR /app
 
 COPY . .
 
-
-
-# Optional: Run Playwright install explicitly if needed
-# RUN npx playwright install --with-deps
+RUN pnpm install --frozen-lockfile
 
 CMD ["pnpm", "start"]
