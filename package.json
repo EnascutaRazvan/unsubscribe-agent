@@ -23,10 +23,13 @@
   "description": "",
   "dependencies": {
     "@ai-sdk/groq": "^2.0.0",
+    "@ai-sdk/openai": "^2.0.0",
     "ai": "^5.0.0",
+    "cheerio": "^1.1.2",
     "cors": "^2.8.5",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
+    "node-html-parser": "^7.0.1",
     "playwright": "^1.54.2"
   },
   "devDependencies": {
