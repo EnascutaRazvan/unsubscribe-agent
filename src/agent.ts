@@ -1,7 +1,7 @@
-// agent.ts — Unsubscribe agent with improved logging & resilient CAPTCHA handling
-// (DOM-free: no window/ScrollBehavior references; Playwright-native scrolling)
+// agent.ts — Unsubscribe agent with improved logging, resilient CAPTCHA handling,
+// and robust cookie-consent handling (CMP-aware, iframe-aware, with settle waits)
 
-import { chromium, type Page, type Browser, type BrowserContext } from "playwright";
+import { chromium, type Page, type Browser, type BrowserContext, type Frame } from "playwright";
 import { generateText } from "ai";
 import { groq } from "@ai-sdk/groq";
 import { openai } from "@ai-sdk/openai";
@@ -60,7 +60,7 @@ interface UnsubscribeResult {
 
 // -------------------- Tunables --------------------
 
-const MAX_STEPS = 10;
+const MAX_STEPS = 5;
 const PLAN_PARSE_RETRIES = 2;
 
 // CAPTCHA grace window: how long we’ll wait & recheck before giving up
@@ -302,56 +302,158 @@ async function waitOutCaptchaIfPresent(page: Page, log: Logger): Promise<boolean
     return false;
 }
 
-// -------------------- Cookie consent --------------------
+// -------------------- Page readiness helpers --------------------
 
-async function clickCookieConsent(page: Page, log: Logger): Promise<boolean> {
-    const selectors = [
-        '[id*="cookie"] button',
-        '[class*="cookie"] button',
-        '[id*="consent"] button',
-        '[class*="consent"] button',
-        "button",
-        'input[type="button"]',
-        'input[type="submit"]'
-    ];
-    const positiveWords = [
-        "accept",
-        "agree",
-        "allow",
-        "confirm",
-        "understand",
-        "ok",
-        "okay",
-        "yes",
-        "continue",
-        "got it",
-        "accept all",
-        "i agree",
-        "allow all",
-        "accept & continue",
-        "accept cookies"
-    ];
+async function waitForLoadSettled(page: Page, log: Logger, hardMs = 8000) {
+    try {
+        await Promise.race([
+            page.waitForLoadState("load", { timeout: hardMs }).catch(() => undefined),
+            page.waitForLoadState("domcontentloaded", { timeout: hardMs }).catch(() => undefined),
+        ]);
+        await page.waitForLoadState("networkidle", { timeout: 3500 }).catch(() => undefined);
+    } catch { /* noop */ }
+    await page.waitForTimeout(jitter(250));
+}
 
-    for (const sel of selectors) {
-        const buttons = await page.$$(sel);
-        for (const btn of buttons) {
-            const visible = await btn.isVisible();
-            if (!visible) continue;
-            const text = ((await btn.textContent()) || "").toLowerCase().trim();
-            if (positiveWords.some((w) => text.includes(w))) {
-                log.log("cookie", `Clicking cookie/consent button`, { text, selector: sel });
-                await btn.click();
-                return true;
-            }
-        }
+async function frameHasCookieUi(frame: Frame): Promise<boolean> {
+    const markers = [
+        // Generic
+        '[id*="cookie"]',
+        '[class*="cookie"]',
+        '[id*="consent"]',
+        '[class*="consent"]',
+        // CMPs
+        "#onetrust-banner-sdk, .onetrust-pc-dark-filter, #onetrust-consent-sdk, #onetrust-accept-btn-handler",
+        "#truste-consent-button, .truste_box_overlay, .trustarc-banner",
+        "#CybotCookiebotDialog, #CybotCookiebotDialogBody",
+        ".qc-cmp2-container, .qc-cmp2-summary",
+        "[id^='sp_message_container_'], [id^='sp_message_iframe_'], #sp-cc, #sp-privacy-message",
+        "[id^='didomi-'], .didomi-popup",
+        "[data-testid='uc-accept-all-button'], #uc-center-container",
+        "#cky-consent, #cookieyes-banner, #cookieyes-accept-all-btn",
+        "#osano-cm, .osano-cm-window, #osano-accept-all",
+        "[data-axeptio-component]"
+    ];
+    for (const sel of markers) {
+        const loc = frame.locator(sel);
+        if (await loc.first().isVisible().catch(() => false)) return true;
     }
     return false;
+}
+
+// -------------------- Cookie consent (CMP-aware, iframe-aware) --------------------
+
+type CookieOptions = { timeoutMs?: number };
+
+async function acceptCookieBanners(page: Page, log: Logger, options: CookieOptions = {}): Promise<boolean> {
+    const timeoutMs = options.timeoutMs ?? 15_000;
+    const start = Date.now();
+    let clickedAny = false;
+
+    // Known CMP accept button selectors (prioritized)
+    const ACCEPT_SELECTORS = [
+        // OneTrust
+        "#onetrust-accept-btn-handler, button#onetrust-accept-btn-handler, .ot-sdk-container button[aria-label*='Accept' i]",
+        // TrustArc
+        "#truste-consent-button, .truste_button_1, .truste-button1, #notice-ok",
+        // Cookiebot
+        "#CybotCookiebotDialogBodyLevelButtonAccept, #CybotCookiebotDialogBodyButtonAccept, #CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+        // Quantcast
+        ".qc-cmp2-summary-buttons .qc-cmp2-summary-buttons-accept-all, .qc-cmp2-ui .qc-cmp2-summary-buttons .qc-cmp2-accept-all",
+        // Didomi
+        "#didomi-notice-agree-button, [data-didomi-translate='notice.agree_button']",
+        // Sourcepoint
+        "#sp-accept, button[aria-label*='Accept All' i], .sp_choice_type_11, .sp_accepted",
+        // Usercentrics
+        "button[data-testid='uc-accept-all-button'], #uc-accept-all, button:has-text('Accept all')",
+        // CookieYes
+        "#cookieyes-accept-all-btn, #cky-consent button.cky-btn-accept",
+        // Osano
+        "#osano-accept-all, .osano-cm-accept-all",
+        // Axeptio (approx)
+        "button:has-text('Accept all'), button[aria-label*='Accept' i]",
+    ];
+
+    // Generic fallbacks by role/text
+    const GENERIC_BUTTON_TEXT = /(accept|agree|allow|continue|ok|okay|got it|yes|save & accept|accept all|i agree)/i;
+
+    while (Date.now() - start < timeoutMs) {
+        let didClickThisRound = false;
+
+        const frames = page.frames();
+        for (const frame of frames) {
+            try {
+                // 1) Known selectors first
+                const known = frame.locator(ACCEPT_SELECTORS.join(", "));
+                if (await known.first().isVisible({ timeout: 50 }).catch(() => false)) {
+                    log.log("cookie", "Clicking known CMP accept button (selectors).");
+                    await known.first().click({ timeout: ACTION_TIMEOUT });
+                    didClickThisRound = true;
+                } else {
+                    // 2) Generic role/text fallback
+                    const generic = frame.getByRole("button", { name: GENERIC_BUTTON_TEXT });
+                    if (await generic.first().isVisible({ timeout: 50 }).catch(() => false)) {
+                        const label = await generic.first().innerText().catch(() => "accept");
+                        log.log("cookie", "Clicking generic cookie accept button.", { label });
+                        await generic.first().click({ timeout: ACTION_TIMEOUT });
+                        didClickThisRound = true;
+                    }
+                }
+
+                // 3) After any click, wait for banner to disappear in this frame and page to settle
+                if (didClickThisRound) {
+                    clickedAny = true;
+                    await waitForLoadSettled(page, log, 6000);
+
+                    try {
+                        const cookieSelectors = [
+                            '[id*="cookie"]',
+                            '[class*="cookie"]',
+                            '[id*="consent"]',
+                            '[class*="consent"]',
+                            '#onetrust-banner-sdk',
+                            '#CybotCookiebotDialog',
+                            '.qc-cmp2-container',
+                            "[id^='sp_message_container_']",
+                            "[id^='didomi-']",
+                            '#cky-consent',
+                            '#osano-cm',
+                        ];
+
+                        await frame.waitForFunction(
+                            (selectors) => {
+                                const d = (globalThis as any).document; // avoid DOM typings requirement
+                                if (!d) return true;
+                                return !selectors.some((s) => d.querySelector(s));
+                            },
+                            cookieSelectors,
+                            { timeout: 5000 }
+                        ).catch(() => undefined);
+                    } catch { /* ignore */ }
+                }
+            } catch { /* ignore frame-level errors */ }
+        }
+
+        if (!didClickThisRound) {
+            const anyCookieUi = await Promise.all(page.frames().map((f) => frameHasCookieUi(f)));
+            if (anyCookieUi.every((v) => v === false)) {
+                await page.waitForTimeout(200);
+                return clickedAny;
+            }
+        }
+
+        if (didClickThisRound) continue;
+        await page.waitForTimeout(200);
+    }
+
+    return clickedAny;
 }
 
 // -------------------- MAIN AGENT --------------------
 
 export class UnsubscribeAgent {
     private model = openai("gpt-4.1-mini");
+    private modelHtml = openai("o4-mini");
     private modelText = groq("llama-3.1-8b-instant");
 
     // ---------- Link extraction ----------
@@ -457,10 +559,11 @@ export class UnsubscribeAgent {
             log.log("info", `[processUnsubscribe] Navigating`, { url: link.url });
             await page.goto(link.url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
 
-            // Cookie consent (best-effort)
-            const cookieClicked = await clickCookieConsent(page, log);
-            if (cookieClicked) {
-                await page.waitForTimeout(jitter(600));
+            // --- Improved cookie handling on load ---
+            const cookieAccepted = await acceptCookieBanners(page, log, { timeoutMs: 15000 });
+            if (cookieAccepted) {
+                log.log("cookie", "Cookie banner handled on load; waiting for page to settle.");
+                await waitForLoadSettled(page, log);
             }
 
             // CAPTCHA grace handling (do NOT fail immediately)
@@ -479,6 +582,70 @@ export class UnsubscribeAgent {
                     runId
                 };
             }
+
+            // Helper: perform an action; if intercepted by cookie overlay, clear & retry once
+            const performActionWithCookieRetry = async (act: ActionStep): Promise<{ ok: boolean; err?: string }> => {
+                const performOnce = async () => {
+                    switch (act.action) {
+                        case "click":
+                            await Promise.race([
+                                page.waitForNavigation({ timeout: jitter(5000) }).catch(() => undefined),
+                                page.click(act.selector, { timeout: ACTION_TIMEOUT })
+                            ]);
+                            break;
+                        case "type":
+                            await page.fill(act.selector, act.value ?? "", { timeout: ACTION_TIMEOUT });
+                            break;
+                        case "select":
+                            await page.selectOption(act.selector, act.value ?? "");
+                            break;
+                        case "check":
+                            await page.check(act.selector, { timeout: ACTION_TIMEOUT });
+                            break;
+                        case "scroll": {
+                            const el = await page.$(act.selector);
+                            if (el) await el.scrollIntoViewIfNeeded();
+                            break;
+                        }
+                        case "wait":
+                            await page.waitForSelector(act.selector, { timeout: Math.max(ACTION_TIMEOUT, 10_000) });
+                            break;
+                        default:
+                            throw new Error("Unknown action: " + act.action);
+                    }
+                };
+
+                try {
+                    await performOnce();
+                    await page.waitForTimeout(jitter(420));
+                    return { ok: true };
+                } catch (e: any) {
+                    const msg = (e?.message || "").toLowerCase();
+                    const looksOverlay =
+                        msg.includes("not visible") ||
+                        msg.includes("not receiv") ||
+                        msg.includes("intercepted") ||
+                        msg.includes("timeout") ||
+                        msg.includes("element is outside") ||
+                        msg.includes("detached from dom");
+                    if (looksOverlay) {
+                        log.log("cookie", "Action failed; attempting to clear cookie banner and retry once.", { action: act.action });
+                        const cleared = await acceptCookieBanners(page, log, { timeoutMs: 7000 });
+                        if (cleared) {
+                            await waitForLoadSettled(page, log, 4000);
+                            try {
+                                await performOnce();
+                                await page.waitForTimeout(jitter(420));
+                                log.log("success", `[processUnsubscribe] Step success after cookie retry`, { action: act.action });
+                                return { ok: true };
+                            } catch (e2: any) {
+                                return { ok: false, err: e2?.message || String(e2) };
+                            }
+                        }
+                    }
+                    return { ok: false, err: e?.message || String(e) };
+                }
+            };
 
             // Main step loop
             let stepCount = 0;
@@ -505,7 +672,7 @@ RESULT: ${lastResult}
                 let plan: { actions?: any[]; finish?: boolean } | null = null;
                 for (let r = 0; r <= PLAN_PARSE_RETRIES; r++) {
                     try {
-                        const { text } = await generateText({ model: this.model, prompt: planPrompt });
+                        const { text } = await generateText({ model: this.modelHtml, prompt: planPrompt });
                         log.log("ai", `[processUnsubscribe] AI Plan`, { preview: text.slice(0, 260) });
                         plan = JSON.parse(text);
                         break;
@@ -535,47 +702,20 @@ RESULT: ${lastResult}
                     try {
                         log.log("info", `[processUnsubscribe] Executing`, { action: act.action, selector: act.selector });
 
-                        switch (act.action) {
-                            case "click":
-                                await Promise.race([
-                                    page
-                                        .waitForNavigation({ timeout: jitter(5000) })
-                                        .catch(() => undefined),
-                                    page.click(act.selector, { timeout: ACTION_TIMEOUT })
-                                ]);
-                                break;
-                            case "type":
-                                await page.fill(act.selector, act.value ?? "", { timeout: ACTION_TIMEOUT });
-                                break;
-                            case "select":
-                                await page.selectOption(act.selector, act.value ?? "");
-                                break;
-                            case "check":
-                                await page.check(act.selector, { timeout: ACTION_TIMEOUT });
-                                break;
-                            case "scroll": {
-                                const el = await page.$(act.selector);
-                                if (el) await el.scrollIntoViewIfNeeded();
-                                break;
-                            }
-                            case "wait":
-                                await page.waitForSelector(act.selector, { timeout: Math.max(ACTION_TIMEOUT, 10_000) });
-                                break;
-                            default:
-                                throw new Error("Unknown action: " + act.action);
-                        }
+                        const result = await performActionWithCookieRetry(act);
 
-                        await page.waitForTimeout(jitter(420));
-                        step.result = "success";
-                        log.log("success", `[processUnsubscribe] Step success`, { action: act.action });
-                        lastResult = "success";
-                    } catch (err: any) {
-                        step.error = err.message;
-                        lastResult = "error: " + err.message;
-                        log.log("error", `[processUnsubscribe] Step failed`, {
-                            action: act.action,
-                            error: err.message
-                        });
+                        if (result.ok) {
+                            step.result = "success";
+                            log.log("success", `[processUnsubscribe] Step success`, { action: act.action });
+                            lastResult = "success";
+                        } else {
+                            step.error = result.err || "unknown error";
+                            lastResult = "error: " + step.error;
+                            log.log("error", `[processUnsubscribe] Step failed`, {
+                                action: act.action,
+                                error: step.error
+                            });
+                        }
                     } finally {
                         step.finishedAt = new Date().toISOString();
                         step.durationMs = Date.now() - t0;
@@ -587,7 +727,11 @@ RESULT: ${lastResult}
                 lastHtml = await page.content();
 
                 // Re-check cookie banners that might reappear
-                await clickCookieConsent(page, log);
+                const cookieAcceptedAgain = await acceptCookieBanners(page, log, { timeoutMs: 7000 });
+                if (cookieAcceptedAgain) {
+                    log.log("cookie", "Cookie banner reappeared mid-flow; handled and letting page settle.");
+                    await waitForLoadSettled(page, log, 5000);
+                }
 
                 // Re-check CAPTCHA; wait briefly if it pops mid-flow
                 const clearedAgain = await waitOutCaptchaIfPresent(page, log);
